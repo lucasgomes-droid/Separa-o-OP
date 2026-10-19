@@ -27,9 +27,11 @@ if ('serviceWorker' in navigator) {
 
 const TIPOS_OP = ['Fábrica', 'Ribbon', 'Líquido'];
 const MOTIVOS_IMPACTO = ['Numlist', 'Fumigação', 'Endereço divergente', 'Operador', 'Ajudantes', 'Outros'];
+const MOTIVOS_PAUSA = ['Almoço', 'Fim de turno', 'Outros'];
 const CLASSE_TIPO = { 'Fábrica': 'fabrica', 'Ribbon': 'ribbon', 'Líquido': 'liquido' };
 const STATUS_INFO = {
   andamento: { label: 'Em andamento', cls: 'andamento' },
+  pausada: { label: 'Pausada', cls: 'pausada' },
   finalizada: { label: 'Finalizada', cls: 'finalizada' },
   cancelada: { label: 'Cancelada', cls: 'cancelada' }
 };
@@ -272,14 +274,14 @@ function processarFila() {
         RESULTADOS[item.id] = { ok: true, data: data };
         if (!ESPERANDO[item.id]) {
           const sp = data && data.separacao;
-          toast('Sincronizado: ' + (item.action === 'iniciarSeparacao' ? 'abertura' : 'finalização') +
+          toast('Sincronizado: ' + (ROTULO_ACAO[item.action] || 'registro') +
             (sp ? ' da OP ' + sp.numeroOp : '') + '.', false, true);
         }
       } catch (err) {
         if (passageira(err)) break; // sem conexão: tenta depois, na mesma ordem
         RESULTADOS[item.id] = { ok: false, err: err };
         if (!ESPERANDO[item.id]) {
-          toast('Não foi possível registrar a ' + (item.action === 'iniciarSeparacao' ? 'abertura' : 'finalização') +
+          toast('Não foi possível registrar a ' + (ROTULO_ACAO[item.action] || 'ação') +
             ' da OP ' + (item.payload.numeroOp || item.rotulo || '') + ': ' + err.message, true);
         }
       }
@@ -421,19 +423,27 @@ function atualizarChrome() {
 }
 
 // Cronômetros: todo elemento com data-desde é atualizado a cada segundo.
+// Tempo mostrado = agora − início − pausas (data-acum, em min). Se a OP
+// está pausada (data-pausado), o relógio fica parado na hora da pausa.
 // Quando o cartão tem data-media (tempo médio do tipo de OP, em min), a
 // cor muda: acima da média → laranja; acima de 1,5× → vermelho.
+// Elementos com data-cron são cronômetros simples (duração da pausa).
 setInterval(function () {
   const agora = agoraServidor();
   document.querySelectorAll('[data-desde]').forEach(function (n) {
-    const ms = agora - Date.parse(n.dataset.desde);
+    const pausado = n.dataset.pausado;
+    const ref = pausado ? Date.parse(pausado) : agora;
+    const ms = ref - Date.parse(n.dataset.desde) - (Number(n.dataset.acum) || 0) * 60000;
     n.textContent = fmtCronometro(ms);
     const card = n.closest('[data-media]');
-    if (card) {
+    if (card && !pausado) {
       const media = Number(card.dataset.media) || 0;
       const min = ms / 60000;
       card.dataset.alerta = !media ? 'ok' : min > media * 1.5 ? 'alto' : min > media ? 'medio' : 'ok';
     }
+  });
+  document.querySelectorAll('[data-cron]').forEach(function (n) {
+    n.textContent = fmtCronometro(agora - Date.parse(n.dataset.cron));
   });
 }, 1000);
 
@@ -509,31 +519,169 @@ async function entrar(idUsuario, senha) {
 
 // ------------------------- CONFERENTE: SEPARAÇÃO -------------------------
 
+// Atributos do cronômetro: tempo efetivo = agora − início − pausas. Com a
+// OP pausada, o relógio para no momento da pausa (data-pausado).
+function cronAttrs(sp) {
+  return 'data-desde="' + esc(sp.inicio) + '" data-acum="' + (Number(sp.pausaAcumMin) || 0) + '"' +
+    (sp.status === 'pausada' && sp.pausadoEm ? ' data-pausado="' + esc(sp.pausadoEm) + '"' : '');
+}
+function efetivoMs(sp) {
+  const ref = sp.status === 'pausada' && sp.pausadoEm ? Date.parse(sp.pausadoEm) : agoraServidor();
+  return ref - Date.parse(sp.inicio) - (Number(sp.pausaAcumMin) || 0) * 60000;
+}
+function linhaPausa(sp) {
+  if (sp.status !== 'pausada') return '';
+  return '<div class="pausa-faixa">⏸ <strong>Pausada · ' + esc(sp.motivoPausa || 'Pausa') + '</strong> desde ' + fmtHora(sp.pausadoEm) +
+    ' · há <span class="mono" data-cron="' + esc(sp.pausadoEm) + '">' + fmtCronometro(agoraServidor() - Date.parse(sp.pausadoEm)) + '</span></div>';
+}
+
 function cartaoOp(sp, opts) {
   opts = opts || {};
-  return '<div class="card stack" style="border-top:4px solid var(--accent)">' +
-    '<div class="row between wrap"><span class="eyebrow">' + esc(opts.titulo || 'Sua separação em andamento') + '</span>' +
-      (opts.tagExtra || tagStatus('andamento')) + '</div>' +
+  const pausada = sp.status === 'pausada';
+  return '<div class="card stack' + (pausada ? ' is-pausada' : '') + '" style="border-top:4px solid ' + (pausada ? 'var(--st-inativo)' : 'var(--accent)') + '">' +
+    '<div class="row between wrap"><span class="eyebrow">' + esc(opts.titulo || (pausada ? 'Sua separação está pausada' : 'Sua separação em andamento')) + '</span>' +
+      (opts.tagExtra || tagStatus(sp.status || 'andamento')) + '</div>' +
     '<div class="row wrap" style="gap:8px"><span class="shiplabel">OP ' + esc(sp.numeroOp) + '</span>' + tagTipo(sp.tipoOp) + '</div>' +
-    '<div class="timer timer--xl" data-desde="' + esc(sp.inicio) + '">' + fmtCronometro(agoraServidor() - Date.parse(sp.inicio)) + '</div>' +
+    '<div><div class="subtle">Tempo de separação' + (pausada ? ' (parado)' : '') + '</div>' +
+    '<div class="timer timer--xl' + (pausada ? ' is-parado' : '') + '" ' + cronAttrs(sp) + '>' + fmtCronometro(efetivoMs(sp)) + '</div></div>' +
+    linhaPausa(sp) +
     '<div class="info-grid">' +
       '<div><div class="k">Quantidade</div><div class="v">' + fmtKg(sp.kg) + '</div></div>' +
       '<div><div class="k">Operadores</div><div class="v">' + sp.operadores + '</div></div>' +
       '<div><div class="k">Ajudantes</div><div class="v">' + sp.ajudantes + '</div></div>' +
       '<div><div class="k">Início</div><div class="v">' + fmtDataHora(sp.inicio) + '</div></div>' +
+      (sp.qtdPausas ? '<div><div class="k">Pausas</div><div class="v">' + sp.qtdPausas + (sp.pausaAcumMin ? ' · ' + fmtDuracao(sp.pausaAcumMin) : '') + '</div></div>' : '') +
     '</div></div>';
 }
 
+// Aplica sobre a separação o que ainda está na fila do aparelho (pausa,
+// retomada, finalização feitas sem internet), para a tela mostrar o
+// estado real que o conferente vê, mesmo antes de chegar à planilha.
+function refereA(x, sp) {
+  return (sp.id && x.payload.idSeparacao === sp.id) || (sp.idReqInicio && x.payload.idRequisicaoInicio === sp.idReqInicio);
+}
+function aplicarFila(sp, fila) {
+  const v = Object.assign({}, sp);
+  v._pendente = false; v._finPend = null;
+  fila.forEach(function (x) {
+    if (!refereA(x, v)) return;
+    if (x.action === 'pausarSeparacao' && v.status !== 'pausada') {
+      v.status = 'pausada'; v.pausadoEm = x.payload.horaCliente; v.motivoPausa = x.payload.motivo;
+      v.qtdPausas = (v.qtdPausas || 0) + 1; v._pendente = true;
+    } else if (x.action === 'retomarSeparacao' && v.status === 'pausada') {
+      v.pausaAcumMin = (Number(v.pausaAcumMin) || 0) + Math.max(0, (Date.parse(x.payload.horaCliente) - Date.parse(v.pausadoEm)) / 60000);
+      v.status = 'andamento'; v.pausadoEm = ''; v.motivoPausa = ''; v._pendente = true;
+    } else if (x.action === 'finalizarSeparacao') {
+      v._finPend = x;
+    }
+  });
+  return v;
+}
+
+const ROTULO_ACAO = {
+  iniciarSeparacao: 'abertura', finalizarSeparacao: 'finalização',
+  pausarSeparacao: 'pausa', retomarSeparacao: 'retomada'
+};
+
+// Painel de motivo da pausa (Almoço, Fim de turno, Outros).
+function painelPausa(sp, aoFechar, aoPausar) {
+  const card = el('<div class="card stack" style="border-top:4px solid var(--st-inativo)">' +
+    '<h3 class="title-lg">⏸ Pausar a OP ' + esc(sp.numeroOp) + '</h3>' +
+    '<p class="subtle" style="margin-top:-6px">O cronômetro para agora e só volta quando tocar em <strong>Retomar</strong>. O tempo pausado não conta na produtividade.</p>' +
+    '<div class="option-grid">' + MOTIVOS_PAUSA.map(function (m) {
+      return '<button type="button" class="option-btn" data-m="' + esc(m) + '">' + (m === 'Almoço' ? '🍽️ ' : m === 'Fim de turno' ? '🌙 ' : '📝 ') + esc(m) + '</button>';
+    }).join('') + '</div></div>');
+  let motivo = null;
+  const obs = campoTexto(card, { label: 'Observação', placeholder: 'Obrigatória em "Outros"', attrs: ' maxlength="200"' });
+  card.querySelectorAll('.option-btn').forEach(function (b) {
+    b.onclick = function () {
+      motivo = b.dataset.m;
+      card.querySelectorAll('.option-btn').forEach(function (x) { x.classList.toggle('is-selected', x === b); });
+      obs.node.querySelector('label').textContent = motivo === 'Outros' ? 'Descreva o motivo *' : 'Observação (opcional)';
+      if (motivo === 'Outros') obs.input.focus();
+    };
+  });
+  const row = el('<div class="grid2"></div>');
+  const cancelar = el('<button type="button" class="btn btn--outline">Voltar</button>');
+  const confirmar = el('<button type="button" class="btn btn--dark">⏸ Pausar agora</button>');
+  row.appendChild(cancelar); row.appendChild(confirmar);
+  card.appendChild(row);
+  cancelar.onclick = aoFechar;
+  confirmar.onclick = function () {
+    if (!motivo) { toast('Escolha o motivo da pausa.', true); return; }
+    if (motivo === 'Outros' && obs.getValue().length < 3) { obs.erro('Descreva o motivo'); return; }
+    confirmar.disabled = true; confirmar.textContent = 'Pausando…';
+    aoPausar(motivo, obs.getValue()).finally(function () { confirmar.disabled = false; confirmar.textContent = '⏸ Pausar agora'; });
+  };
+  return card;
+}
+
+// Envia pausa ou retomada (com fila offline e anti-duplicidade).
+async function enviarPausaRetomada(action, sp, extra) {
+  const payload = Object.assign({
+    idRequisicao: novoId(), idSeparacao: sp.id || '', idRequisicaoInicio: sp.id ? '' : (sp.idReqInicio || ''),
+    horaCliente: isoAgora()
+  }, extra || {});
+  try {
+    const r = await enviarComFila(action, payload, sp.numeroOp);
+    const nome = action === 'pausarSeparacao' ? 'pausada' : 'retomada';
+    if (r.pendente) toast('Sem conexão: a ' + ROTULO_ACAO[action] + ' foi guardada no aparelho e será enviada sozinha.', false);
+    else toast('OP ' + sp.numeroOp + ' ' + nome + ' às ' + fmtHora(payload.horaCliente) + '.', false, true);
+    return true;
+  } catch (err) {
+    if (err.code === 'SESSAO') { sair(); return false; }
+    toast(err.message, true);
+    return false;
+  }
+}
+
+// Botões de ação de uma separação aberta (tela do conferente e detalhe).
+function acoesSeparacao(container, sp, voltarPara, aoMudar) {
+  const box = el('<div class="stack"></div>');
+  container.appendChild(box);
+  if (sp.status === 'pausada') {
+    const ret = el('<button class="btn btn--primary btn--block btn--xl">▶ Retomar Separação</button>');
+    ret.onclick = async function () {
+      ret.disabled = true; ret.textContent = 'Retomando…';
+      const ok = await enviarPausaRetomada('retomarSeparacao', sp);
+      if (ok) aoMudar(); else { ret.disabled = false; ret.textContent = '▶ Retomar Separação'; }
+    };
+    box.appendChild(ret);
+    box.appendChild(el('<div class="note">Para finalizar esta OP, retome primeiro. O cronômetro continua de onde parou.</div>'));
+    return { painelAberto: function () { return false; } };
+  }
+  let aberto = false;
+  const linha = el('<div class="grid2"></div>');
+  const pausar = el('<button class="btn btn--outline btn--xl">⏸ Pausar</button>');
+  const fin = el('<button class="btn btn--accent btn--xl">⏹ Finalizar</button>');
+  linha.appendChild(pausar); linha.appendChild(fin);
+  box.appendChild(linha);
+  fin.onclick = function () { go('finalizar', { sepAtual: sp, reqFinalizar: novoId(), voltarPara: voltarPara }); };
+  pausar.onclick = function () {
+    aberto = true; linha.hidden = true;
+    const painel = painelPausa(sp,
+      function () { aberto = false; painel.remove(); linha.hidden = false; },
+      async function (motivo, obs) {
+        const ok = await enviarPausaRetomada('pausarSeparacao', sp, { motivo: motivo, observacao: obs });
+        if (ok) { aberto = false; aoMudar(); }
+      });
+    box.appendChild(painel);
+    painel.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  };
+  return { painelAberto: function () { return aberto; } };
+}
+
 async function renderInicio(g) {
-  appendHtml(app, screenHeader('Separação', 'Olá, ' + S.usuario.NOME.split(' ')[0], 'Abra e finalize a sua separação de OP'));
+  appendHtml(app, screenHeader('Separação', 'Olá, ' + S.usuario.NOME.split(' ')[0], 'Abra, pause e finalize a sua separação de OP'));
   const body = el('<div class="stack"><p class="subtle">Carregando…</p></div>');
   app.appendChild(body);
+  let acoes = null;
 
   async function carregar() {
     let minha = null, falhou = false;
     try { const d = await api('getMinha', {}, { silencioso: true }); ajustarRelogio(d.agora); minha = d.separacao; }
     catch (e) { falhou = true; }
-    if (!viva(g)) return;
+    if (!viva(g) || (acoes && acoes.painelAberto())) return;
     const fila = filaDoUsuario();
     const iniPend = fila.find(function (x) { return x.action === 'iniciarSeparacao'; });
     body.innerHTML = '';
@@ -543,26 +691,24 @@ async function renderInicio(g) {
     if (!sp && iniPend) {
       const p = iniPend.payload;
       sp = { id: '', idReqInicio: p.idRequisicao, numeroOp: p.numeroOp, tipoOp: p.tipoOp, kg: p.qtdKg, operadores: p.operadores,
-        ajudantes: p.ajudantes, inicio: p.inicioCliente, conferente: S.usuario.NOME, status: 'andamento' };
+        ajudantes: p.ajudantes, inicio: p.inicioCliente, conferente: S.usuario.NOME, idConferente: S.usuario.ID_USUARIO,
+        status: 'andamento', pausaAcumMin: 0, qtdPausas: 0 };
       pendenteIni = true;
     }
     if (sp) {
-      const finPend = fila.find(function (x) {
-        return x.action === 'finalizarSeparacao' &&
-          ((sp.id && x.payload.idSeparacao === sp.id) || (sp.idReqInicio && x.payload.idRequisicaoInicio === sp.idReqInicio));
-      });
+      sp = aplicarFila(sp, fila);
+      const finPend = sp._finPend;
       appendHtml(body, cartaoOp(sp, {
         tagExtra: finPend ? '<span class="tag tag--pendente">Finalização aguardando envio</span>'
-          : pendenteIni ? '<span class="tag tag--pendente">Abertura aguardando envio</span>' : null
+          : pendenteIni ? '<span class="tag tag--pendente">Abertura aguardando envio</span>'
+          : sp._pendente ? '<span class="tag tag--pendente">' + (sp.status === 'pausada' ? 'Pausa' : 'Retomada') + ' aguardando envio</span>' : null
       }));
       if (finPend) {
         body.appendChild(el('<div class="note warn">A finalização desta OP foi registrada às ' + fmtHora(finPend.payload.fimCliente) +
           ' e está guardada no aparelho. Ela será enviada para a planilha assim que houver conexão — não é preciso finalizar de novo.</div>'));
       } else {
-        const btn = el('<button class="btn btn--accent btn--block btn--xl">⏹ Finalizar Separação</button>');
-        btn.onclick = function () { go('finalizar', { sepAtual: sp, reqFinalizar: novoId(), voltarPara: 'inicio' }); };
-        body.appendChild(btn);
-        if (pendenteIni) body.appendChild(el('<div class="note warn">Esta abertura ainda não chegou à planilha (sem conexão). Ela será enviada com a hora em que você tocou em Iniciar.</div>'));
+        acoes = acoesSeparacao(body, sp, 'inicio', function () { render(); });
+        if (pendenteIni || sp._pendente) body.appendChild(el('<div class="note warn">Há registros desta OP guardados no aparelho (sem conexão). Eles serão enviados com a hora em que você tocou em cada botão.</div>'));
       }
       return;
     }
@@ -570,7 +716,7 @@ async function renderInicio(g) {
       '<span>Registra a data e a hora de início automaticamente</span></button>');
     btn.onclick = function () { go('iniciar'); };
     body.appendChild(btn);
-    body.appendChild(el('<div class="note">Regra: cada conferente pode ter <strong>apenas uma OP em andamento</strong>. Para abrir outra, finalize a atual.</div>'));
+    body.appendChild(el('<div class="note">Regra: cada conferente pode ter <strong>apenas uma OP aberta</strong> (em andamento ou pausada). Para abrir outra, finalize a atual.</div>'));
   }
   await carregar();
   agendar(function () { if (S.screen === 'inicio') carregar(); });
